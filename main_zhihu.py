@@ -26,12 +26,12 @@ class ZhihuParser:
         self.session.headers.update(self.headers)
         self.soup = None
         self.logger = logging.getLogger('zhihu_parser')
-        
+
         if self.keep_logs:
             self.logger.setLevel(logging.INFO)
             if not self.logger.handlers and not os.path.exists('./logs'):
                 os.makedirs('./logs', exist_ok=True)
-            
+
             if not self.logger.handlers:
                 handler = logging.FileHandler(
                     './logs/zhihu_download.log', encoding='utf-8')
@@ -89,6 +89,9 @@ class ZhihuParser:
             elif target_link.find("zvideo") != -1:
                 # 如果是视频
                 title = self.parse_zhihu_zvideo(target_link)
+            elif target_link.find("people") != -1:
+                # 如果是用户主页
+                title = self.parse_zhihu_user(target_link)
             else:
                 # 如果是单篇文章
                 title = self.parse_zhihu_article(target_link)
@@ -315,7 +318,7 @@ class ZhihuParser:
 
             markdown_title = self.save_and_transform(
                 title_element, content_element, author, target_link, date)
-            
+
             self.log('info', f"Successfully parsed article: {markdown_title}")
 
             return markdown_title
@@ -495,6 +498,196 @@ class ZhihuParser:
             # 在这种情况下，返回当前文件夹名，以便打包已下载的内容
             return os.path.basename(os.getcwd())
 
+    def parse_zhihu_user(self, target_link):
+        """
+        解析知乎用户主页并下载用户的所有文章和回答
+        """
+        try:
+            self.check_connect_error(target_link)
+
+            # 从URL中提取用户名
+            username = target_link.split('/')[-1]
+
+            # 获取用户信息
+            user_info = self.soup.select_one('div.ProfileHeader-content')
+            if user_info:
+                user_name = user_info.select_one(
+                    'span.ProfileHeader-name').text.strip()
+            else:
+                user_name = username
+
+            # 创建用户文件夹
+            folder_name = get_valid_filename(f"{user_name}_知乎内容")
+            os.makedirs(folder_name, exist_ok=True)
+            os.chdir(folder_name)
+
+            # 创建处理记录文件
+            processed_filename = "zhihu_processed_items.txt"
+            processed_items = self.load_processed_articles(processed_filename)
+            failed_items_filename = "zhihu_failed_items.txt"
+
+            # 读取失败的项目列表
+            failed_items = set()
+            if os.path.exists(failed_items_filename):
+                with open(failed_items_filename, 'r', encoding='utf-8') as file:
+                    failed_items = set(file.read().splitlines())
+
+            user_id = username
+
+            success_count = 0
+            failure_count = 0
+
+            # 初始化进度条
+            progress_bar = tqdm(desc="下载用户内容")
+
+            # 下载用户文章
+            articles_success, articles_failure = self._download_user_articles(
+                user_id, processed_items, failed_items, progress_bar)
+            success_count += articles_success
+            failure_count += articles_failure
+
+            # 下载用户回答
+            answers_success, answers_failure = self._download_user_answers(
+                user_id, processed_items, failed_items, progress_bar)
+            success_count += answers_success
+            failure_count += answers_failure
+
+            progress_bar.close()
+
+            # 更新处理记录
+            with open(processed_filename, 'w', encoding='utf-8') as file:
+                file.write('\n'.join(processed_items))
+
+            # 如果失败文件为空，则删除
+            if len(failed_items) == 0 and os.path.exists(failed_items_filename):
+                os.remove(failed_items_filename)
+
+            self.log('info', f"用户内容下载完成。成功: {success_count}, 失败: {failure_count}")
+
+            return folder_name
+
+        except Exception as e:
+            self.log('error', f"Error parsing user {target_link}: {str(e)}")
+            # 返回当前文件夹名
+            return os.path.basename(os.getcwd())
+
+    def _download_user_articles(self, user_id, processed_items, failed_items, progress_bar):
+        """
+        下载用户的所有文章
+        """
+        success_count = 0
+        failure_count = 0
+        offset = 0
+
+        while True:
+            try:
+                # 知乎用户文章API
+                api_url = f"/api/v4/members/{user_id}/articles?include=data[*].content&offset={offset}&limit=20"
+                response = self.session.get(f"https://www.zhihu.com{api_url}")
+                data = response.json()
+
+                if not data.get("data"):
+                    break
+
+                for article in data["data"]:
+                    article_id = str(article["id"])
+
+                    # 如果已经处理过，跳过
+                    if article_id in processed_items:
+                        continue
+
+                    # 如果之前失败过，再试一次
+                    retry_failed = article_id in failed_items
+
+                    try:
+                        article_link = f"https://zhuanlan.zhihu.com/p/{article_id}"
+                        self.parse_zhihu_article(article_link)
+
+                        # 成功处理，记录
+                        processed_items.add(article_id)
+                        if retry_failed:
+                            failed_items.remove(article_id)
+                        success_count += 1
+                        progress_bar.update(1)
+
+                    except Exception as e:
+                        failure_count += 1
+                        failed_items.add(article_id)
+                        self.log('error', f"Error processing article {article_id}: {str(e)}")
+
+                if data.get("paging", {}).get("is_end", True):
+                    break
+
+                offset += 20
+
+            except Exception as e:
+                self.log('error', f"Error fetching user articles: {str(e)}")
+                offset += 20
+                if offset > 200:  # 如果失败超过10页，就放弃
+                    self.log('error', "Too many failures fetching user articles, giving up")
+                    break
+
+        return success_count, failure_count
+
+    def _download_user_answers(self, user_id, processed_items, failed_items, progress_bar):
+        """
+        下载用户的所有回答
+        """
+        success_count = 0
+        failure_count = 0
+        offset = 0
+
+        while True:
+            try:
+                # 知乎用户回答API
+                api_url = f"/api/v4/members/{user_id}/answers?include=data[*].content&offset={offset}&limit=20"
+                response = self.session.get(f"https://www.zhihu.com{api_url}")
+                data = response.json()
+
+                if not data.get("data"):
+                    break
+
+                for answer in data["data"]:
+                    answer_id = str(answer["id"])
+                    question_id = str(answer["question"]["id"])
+
+                    # 如果已经处理过，跳过
+                    if answer_id in processed_items:
+                        continue
+
+                    # 如果之前失败过，再试一次
+                    retry_failed = answer_id in failed_items
+
+                    try:
+                        answer_link = f"https://www.zhihu.com/question/{question_id}/answer/{answer_id}"
+                        self.parse_zhihu_answer(answer_link)
+
+                        # 成功处理，记录
+                        processed_items.add(answer_id)
+                        if retry_failed:
+                            failed_items.remove(answer_id)
+                        success_count += 1
+                        progress_bar.update(1)
+
+                    except Exception as e:
+                        failure_count += 1
+                        failed_items.add(answer_id)
+                        self.log('error', f"Error processing answer {answer_id}: {str(e)}")
+
+                if data.get("paging", {}).get("is_end", True):
+                    break
+
+                offset += 20
+
+            except Exception as e:
+                self.log('error', f"Error fetching user answers: {str(e)}")
+                offset += 20
+                if offset > 200:  # 如果失败超过10页，就放弃
+                    self.log('error', "Too many failures fetching user answers, giving up")
+                    break
+
+        return success_count, failure_count
+
 
 if __name__ == "__main__":
     cookies = "your cookies here"
@@ -510,6 +703,9 @@ if __name__ == "__main__":
 
     # 专栏
     url = "https://www.zhihu.com/column/c_1796502192443777024"
+
+    # 用户主页
+    # url = "https://www.zhihu.com/people/Glenn"
 
     # hexo_uploader=True 表示在公式前后加上 {% raw %} {% endraw %}，以便 hexo 正确解析
     parser = ZhihuParser(cookies)
